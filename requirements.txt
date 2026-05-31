@@ -1,0 +1,20 @@
+# Deps ของโปรเจกต์ (torch ติดตั้งแยกด้วย CUDA index ใน setup_env.ps1)
+# หมายเหตุ: ทดสอบแล้วใช้ได้กับ transformers 5.9.0 — generate Typhoon2 3B ปกติดี
+transformers>=4.46
+accelerate>=0.34
+bitsandbytes>=0.44        # 4-bit/8-bit quantization (มี Windows wheel ตั้งแต่ >=0.43)
+datasets>=2.20
+sentencepiece
+peft>=0.13
+trl>=0.12
+pdfplumber                # Phase 2: อ่าน PDF
+google-generativeai       # Phase 2: generate Q&A (Gemini gemini-2.5-flash)
+requests                  # Phase 2: crawl reg.chula.ac.th
+beautifulsoup4            # Phase 2: parse HTML
+lxml                      # Phase 2: parser ของ bs4
+truststore                # Phase 2: ใช้ Windows trust store แก้ SSL ของ proxy MITM (จำเป็นบนเครือข่ายนี้)
+faiss-cpu                 # Phase 7: RAG
+sentence-transformers     # Phase 7: embedding
+jupyter
+ipykernel
+pip                       # ให้ %pip ใน notebook ใช้ได้ใน venv ของ uv

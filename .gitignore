@@ -1,0 +1,11 @@
+# secrets — ห้าม commit เด็ดขาด (มี GEMINI_API_KEY)
+.env
+
+# env / caches / tools — อยู่บนไดรฟ์ D ทั้งหมด ไม่ commit
+.venv/
+.python/
+.cache/
+.tools/uv.exe
+
+# artifacts โมเดล (หลาย GB) — push เป็น Kaggle Dataset แทน ไม่ commit
+artifacts/
