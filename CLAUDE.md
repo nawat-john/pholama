@@ -11,6 +11,8 @@ An **implemented** Python project that runs the 7-phase LLM compression pipeline
 
 **Env/run:** venv อยู่ที่ `.venv` (เปิดด้วย `. .tools\activate.ps1`). ต้องตั้ง `$env:PYTHONUTF8="1"` เสมอ (กัน cp874 crash). คำสั่งต่อ phase ดูใน `REPORT.md` ภาคผนวก / `PROGRESS.md`. ไม่มี test/linter ทางการ — verify ด้วยการรันสคริปต์ + เช็ค ppl/generate
 
+**ถาม-ตอบ (deliverable):** `app.py` = entry-point RAG (auto-start `llama-server` Q4_K_M → retrieve e5-small+faiss → ตอบ). รันตรง: `.venv\Scripts\python.exe app.py "คำถาม"` (flags: `--no-rag -k --max-tokens --show-sources`). มี **exe ห่อบางๆ**: `dist\pholama.exe "คำถาม"` (จาก `pholama_launcher.py`, stdlib ล้วน → shell out เข้า venv; ไม่ bundle torch). Build ใหม่: `build_exe.ps1` (หรือ `.venv\Scripts\python.exe -m PyInstaller --onefile --console --name pholama pholama_launcher.py`). หมายเหตุ: แต่ละครั้งโหลด torch+e5 ใหม่ (~นาที); server ค้างไว้ครั้งถัดไปไม่ต้องโหลด GGUF ซ้ำ
+
 **Local runtime gotchas (สำคัญ — ดู memory ด้วย):** เครื่องนี้ RTX 3050 Laptop **4GB** — โมเดล bf16 รันได้ผ่าน CUDA **sysmem fallback** (spill ลง RAM, ช้ากว่า VRAM แต่เร็วกว่า CPU ~9×) • **ห้าม `import transformers.Trainer`/`datasets`** ในสคริปต์ local → **pyarrow segfault** (exit -1073741819) → เขียน training loop เอง • **merge LoRA ต้องทำบน bf16 base** ไม่ใช่ 4-bit (ไม่งั้น ppl เสีย) • **sentence_transformers ก็ segfault** → ใช้ transformers AutoModel ตรงๆ • pip install ของ gguf/llama.cpp อาจทับ torch เป็น CPU build
 
 ## The project the plan describes
