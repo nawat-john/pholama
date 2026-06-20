@@ -1,0 +1,675 @@
+% =====================================================================
+%  Pholama: A 7-Stage Pipeline for Compressing and Specializing a
+%           3B-Parameter Large Language Model for On-Device Deployment
+%  Publication-grade technical report (compile with pdfLaTeX)
+%  Requires: bibtex run for the references (see report.bib placeholder)
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+% ---------- Packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{fancyhdr}
+\usepackage{microtype}
+\usepackage[hidelinks,colorlinks=true,linkcolor=blue!50!black,
+            citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+% ---------- Convenience macros ----------
+\newcommand{\param}[1]{\ensuremath{#1\,\text{B}}}
+\sisetup{group-separator={,},detect-weight=true,detect-family=true}
+\newcolumntype{R}{>{\raggedleft\arraybackslash}X}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+
+% ---------- Header / footer ----------
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Pholama: Compressing \& Specializing a 3B LLM}
+\lhead{}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ---------- Title ----------
+\title{\textbf{Pholama: A Seven-Stage Pipeline for Compressing and\\
+Specializing a 3B-Parameter Large Language Model\\
+Toward Ultra-Low-Resource On-Device Deployment}}
+
+\author{
+  Nawat Pimolsathien\\
+  \small Independent Research Project\\
+  \small \texttt{nawatpim@gmail.com}
+}
+\date{\today}
+
+% =====================================================================
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% =====================================================================
+\begin{abstract}
+\noindent
+Large language models (LLMs) deliver strong natural-language understanding
+but their memory and compute footprints preclude deployment on small,
+resource-constrained devices. This report presents \textbf{Pholama}, an
+end-to-end seven-stage pipeline that compresses and specializes
+\emph{Typhoon~2 3B}---a Llama~3.2--based Thai--English instruction model of
+\num{3.213} billion parameters---into a domain expert for question answering
+about the Office of the Registrar, Chulalongkorn University. The pipeline
+combines (i)~\emph{vocabulary trimming} of unused-language tokens, (ii)~%
+\emph{structured layer pruning} guided by domain calibration data,
+(iii)~\emph{QLoRA recovery fine-tuning}, (iv)~\emph{post-training
+quantization} to the GGUF~Q4\_K\_M format, and (v)~\emph{retrieval-augmented
+generation (RAG)} at deployment. The resulting model is \textbf{20.5\%
+smaller} in parameters (\param{3.21}~$\rightarrow$~\param{2.55}), occupies a
+\textbf{1.53~GB} quantized deployment file (a 76.2\% reduction versus the
+original bf16 weights), runs \textbf{2.2$\times$ faster} on a bare CPU
+(\SI{23.5}{tok/s} vs.\ \SI{10.6}{tok/s} on GPU), and \emph{improves}
+in-domain answer quality by 35.7\% relative (\SI{35.0}{\percent}~$\rightarrow$~%
+\SI{47.5}{\percent} under RAG). Out-of-domain ability (code/mathematics)
+degrades as an \emph{intended} consequence of specialization. The entire
+pipeline was executed on a single consumer-grade RTX~3050 Laptop GPU with
+\SI{4}{GB} of VRAM, demonstrating that aggressive, research-grade LLM
+compression is achievable without cloud infrastructure. We position this work
+as a step toward the longer-term objective of running specialized language
+models on extremely small devices such as wearables or pocket calculators.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+\hrule
+\bigskip
+
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Background and Motivation}
+The capabilities of large language models scale with parameter count, but so
+do their storage, memory-bandwidth, and energy requirements. A typical 3B
+model stored in 16-bit precision occupies roughly \SI{6.4}{GB} and requires a
+GPU for interactive inference, placing it beyond the reach of phones,
+microcontrollers, embedded systems, and other ultra-low-resource hardware.
+Yet many practical applications---an institutional FAQ assistant, an offline
+help desk, a single-domain chatbot---do not require the model's full general
+intelligence. They require fluent comprehension and reasoning \emph{within a
+narrow domain}, with factual grounding supplied externally.
+
+This observation motivates a \emph{compress-and-specialize} strategy: rather
+than preserving a model's general competence, we deliberately discard the
+parts that serve out-of-domain tasks (e.g.\ multilingual coverage, code, and
+mathematics) and reinvest the saved capacity into a smaller, faster, domain-%
+focused model. The chosen domain is Thai--English question answering for the
+Office of the Registrar, Chulalongkorn University (\texttt{reg.chula.ac.th}),
+a setting with stable terminology and a well-bounded knowledge base.
+
+\subsection{Objectives}
+The project pursues the following concrete objectives:
+\begin{enumerate}[label=(O\arabic*),leftmargin=2.4em]
+  \item \textbf{Reduce model size.} Shrink the \param{3.21} base model toward
+        the \param{1.8}--\param{2.5} range while keeping the deployment file
+        within \SIrange{1.5}{2}{GB} of RAM after quantization.
+  \item \textbf{Enable on-device / CPU-only inference.} Produce an artifact
+        that runs at interactive speed without a discrete GPU.
+  \item \textbf{Preserve (and ideally improve) in-domain quality} through
+        recovery fine-tuning and retrieval augmentation, while accepting
+        out-of-domain regression as evidence of successful specialization.
+  \item \textbf{Maintain scientific rigor} via a three-baseline comparison
+        framework and reproducible, single-machine execution.
+\end{enumerate}
+
+\noindent
+The stated \emph{long-term} aspiration of the Pholama project is to push LLM
+optimization far enough that a competent, single-purpose language model can
+run on extremely small devices---a smartwatch or even a calculator-class
+microcontroller. The present report documents the first milestone toward that
+vision: a fully functioning, CPU-deployable specialized model derived end-to-%
+end on commodity hardware.
+
+\subsection{Contributions}
+\begin{itemize}[leftmargin=1.6em]
+  \item A reproducible seven-stage compression-and-specialization pipeline,
+        each stage executed and validated on a single \SI{4}{GB}-VRAM laptop
+        GPU.
+  \item An empirical characterization of vocabulary trimming on an
+        \emph{English-dominant} tokenizer, correcting the common assumption
+        that ``dropping dead languages'' alone yields large savings.
+  \item A pruning sensitivity analysis showing that the textbook
+        ShortGPT~$28{\to}20$ configuration collapses the model, whereas a
+        knee-point of $28{\to}24$ remains recoverable.
+  \item A full original-versus-specialized evaluation across three axes
+        (size, efficiency, quality) with a deployable RAG demonstrator.
+\end{itemize}
+
+% =====================================================================
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Base Model Specification}
+The base model is Typhoon~2 3B, an instruction-tuned Thai--English model built
+on the Llama~3.2 3B architecture. Its verified configuration
+(Table~\ref{tab:basespec}) was confirmed against the published
+\texttt{config.json} prior to any modification.
+
+\begin{table}[H]
+  \centering
+  \caption{Verified architecture of the base model (Typhoon~2 3B).}
+  \label{tab:basespec}
+  \begin{tabular}{lr}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    Hidden size $d$                       & \num{3072} \\
+    Number of transformer layers          & \num{28} \\
+    Attention heads                       & \num{24} \\
+    Key/value heads (GQA)                 & \num{8} \\
+    Head dimension                        & \num{128} \\
+    FFN intermediate size                 & \num{8192} \\
+    Vocabulary size                       & \num{128256} \\
+    Tied input/output embeddings          & \texttt{true} \\
+    \midrule
+    \textbf{Total parameters}             & \textbf{\num{3212749824}} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+A parameter-budget analysis (Table~\ref{tab:budget}) reveals two facts that
+shape the entire compression strategy: (1)~the tied embedding accounts for
+only $\sim$12\% of the parameters---so vocabulary trimming helps but is not
+the dominant lever; and (2)~within each transformer layer, the feed-forward
+network (FFN) dominates at $\sim$75\%, making it the prime target for width
+pruning.
+
+\begin{table}[H]
+  \centering
+  \caption{Where the parameters live in the base model.}
+  \label{tab:budget}
+  \begin{tabular}{lrr}
+    \toprule
+    \textbf{Component} & \textbf{Parameters} & \textbf{Share} \\
+    \midrule
+    Embedding (tied input $+$ output)     & \num{394000000}  & 12.3\% \\
+    28 transformer layers                 & \num{2819000000} & 87.7\% \\
+    \quad Attention (per layer)           & \num{25200000}   & 25\% of layer \\
+    \quad FFN / MLP (per layer)           & \num{75500000}   & 75\% of layer \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{System Architecture and Pipeline Overview}
+The Pholama pipeline (Figure~\ref{fig:pipeline}) transforms the base model
+through seven sequential stages. Stages~3--6 monotonically reduce model size;
+stage~5 restores quality; stage~7 supplies external factual grounding so that
+volatile facts (deadlines, regulations) need not be encoded in the weights.
+
+\begin{figure}[H]
+  \centering
+  % Replace with an actual diagram, e.g. \includegraphics[width=\textwidth]{figures/pipeline.pdf}
+  \fbox{\parbox{0.95\textwidth}{\centering\small
+    \texttt{Typhoon2 3B (3.21B)}\\[2pt]
+    $\downarrow$ \textbf{P3} vocabulary trim \quad (128{,}256 $\to$ 44{,}926 vocab)\\
+    \texttt{vocab-trimmed (2.957B)}\\[2pt]
+    $\downarrow$ \textbf{P4} structured layer prune \quad (28 $\to$ 24 layers)\\
+    \texttt{pruned (2.554B, ppl 14.1)}\\[2pt]
+    $\downarrow$ \textbf{P5} QLoRA recovery fine-tune \quad (ppl 14.1 $\to$ 7.6)\\
+    \texttt{recovered (2.554B, bf16)}\\[2pt]
+    $\downarrow$ \textbf{P6} quantize $\to$ GGUF Q4\_K\_M \quad (file 1.53 GB)\\
+    \texttt{deployable artifact}\\[2pt]
+    $\downarrow$ \textbf{P7} RAG (e5-small $+$ FAISS $+$ llama-server)\\
+    \texttt{Registrar Q\&A assistant}
+  }}
+  \caption{The seven-stage Pholama compression-and-specialization pipeline.
+  Placeholder for a rendered diagram (\texttt{figures/pipeline.pdf}).}
+  \label{fig:pipeline}
+\end{figure}
+
+\subsection{Phase 1 --- Environment and Baseline}
+Tooling comprises PyTorch (CUDA~12.4), Hugging Face
+\texttt{transformers}/\texttt{peft}/\texttt{bitsandbytes}, FAISS, and
+\texttt{llama.cpp}. The base model was loaded in 4-bit and profiled to
+establish baseline~B1 (latency, VRAM, and parameter count). Parameter counts
+are computed from the configuration rather than \texttt{numel()}, because
+4-bit packing halves the reported element count.
+
+\subsection{Phase 2 --- Domain Dataset Construction}
+A web crawl of \texttt{reg.chula.ac.th} (52 HTML pages and $\sim$30 PDFs)
+produced 361 text chunks. A large teacher model (Gemini~2.5 Flash) generated
+4{,}198 synthetic Thai--English question--answer pairs grounded in those
+chunks, spanning formal/informal registers and Thai/English/code-switched
+phrasing. Heuristic filtering (self-reference, no-information, length, and
+near-duplicate removal) reduced the set to 4{,}016 clean pairs, split
+80/10/10 into \textbf{3{,}212 / 401 / 403} train/validation/test items. A
+leak assertion guarantees that no test item appears in calibration or
+training data. The same corpus is reused for vocabulary analysis (P3),
+pruning calibration (P4), recovery training (P5), and retrieval (P7).
+
+\subsection{Phase 3 --- Vocabulary Trimming}
+Following Ushio et al.~\cite{ushio2023vocab}, dead tokens are removed from the
+tied \texttt{embed\_tokens}/\texttt{lm\_head} matrix. Running the tokenizer
+over the corpus plus train and validation sets (never the test set) yielded
+5{,}388 distinct tokens. A key empirical finding contradicts the original
+plan's assumption: the Llama~3.2 tokenizer is \emph{English-dominant}
+(ASCII/English $\approx$97{,}718 tokens; Thai only 2{,}462; genuinely dead
+languages---CJK, Korean, Arabic, Cyrillic---only $\approx$24{,}044). Dropping
+dead languages \emph{alone} removes just 18.8\% of the vocabulary. To reach
+the target $\sim$40k, an \emph{aggressive} mode additionally drops
+rarely-used English/code tokens by tiktoken frequency rank, retaining the
+byte alphabet (256), special tokens, all Thai, common Latin-1, punctuation,
+corpus tokens, and the lowest-id (most frequent) English tokens, plus the
+transitive closure of BPE merges. The result is a vocabulary of
+\textbf{44{,}926} tokens (a 65.1\% reduction) and a model of
+\textbf{\param{2.9568}}. Any text remains encodable via byte fallback.
+
+\subsection{Phase 4 --- Structured Pruning}
+\paragraph{Layer pruning.} Layer importance is estimated with the ShortGPT
+Block-Influence criterion---the angular (cosine) distance between a layer's
+input and output hidden states under domain calibration data:
+\begin{equation}
+  \mathrm{BI}(\ell) \;=\; 1 - \mathbb{E}_{x}\!\left[
+  \frac{\mathbf{h}^{(\ell)}_{\text{in}}(x)\cdot
+        \mathbf{h}^{(\ell)}_{\text{out}}(x)}
+       {\lVert \mathbf{h}^{(\ell)}_{\text{in}}(x)\rVert\,
+        \lVert \mathbf{h}^{(\ell)}_{\text{out}}(x)\rVert}\right].
+  \label{eq:bi}
+\end{equation}
+Layers with the smallest $\mathrm{BI}$ contribute least and are removed; the
+remaining layers are re-indexed (\texttt{layer\_idx} reassignment is required
+for correct rotary-position behavior). A sweep over the number of removed
+layers (Table~\ref{tab:sweep}) shows a sharp ``knee'': removing 4 layers
+($28{\to}24$) yields a recoverable perplexity of 13.2, whereas removing 6 or
+8 collapses the model. The plan's textbook $28{\to}20$ target is therefore
+\emph{infeasible} for this model.
+
+\paragraph{Width pruning (aggressive variant).} For an even smaller variant,
+the FFN intermediate dimension is reduced $8192 \to 6144$ ($-25\%$) using
+Wanda-style activation importance, producing a \param{2.1011} model at the
+cost of higher perplexity (18.6).
+
+\begin{table}[H]
+  \centering
+  \caption{Layer-pruning sensitivity sweep (validation perplexity, pre-recovery).}
+  \label{tab:sweep}
+  \begin{tabular}{lrl}
+    \toprule
+    \textbf{Layers removed} & \textbf{Resulting depth} & \textbf{Val.\ perplexity} \\
+    \midrule
+    0 (vocab-trimmed base) & 28 & 5.77 \\
+    2  & 26 & 7.2 \\
+    \textbf{4} & \textbf{24} & \textbf{13.2 \;(chosen knee)} \\
+    6  & 22 & 131 \\
+    8  & 20 & 237 \;(output degenerate) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Phase 5 --- QLoRA Recovery Fine-Tuning}
+The pruned model is fine-tuned with QLoRA: a 4-bit (nf4) base with LoRA
+adapters of rank~16 and $\alpha=32$ applied to the
+\texttt{q,k,v,o,gate,up,down} projections. Training used sequence length~512,
+batch size~1 with gradient accumulation~16 (effective batch~16), two epochs
+(402 steps), a cosine schedule with peak learning rate $2\times10^{-4}$, and
+\emph{prompt masking} so that loss is computed only over answer tokens.
+Critically, the adapter is \textbf{merged onto a bf16 base}, not the 4-bit
+base: merging onto the quantized base corrupts perplexity ($9{\to}17$) and
+prevents GGUF conversion. Recovery reduced perplexity from \textbf{14.14 to
+7.59} ($-46\%$). Peak training memory was only \SI{2.4}{GB}, well below the
+plan's \SIrange{6}{12}{GB} estimate, owing to the small adapter rank,
+gradient checkpointing, and a plain AdamW optimizer.
+
+\subsection{Phase 6 --- Quantization}
+The recovered bf16 model is converted to GGUF via
+\texttt{convert\_hf\_to\_gguf.py} and quantized with \texttt{llama-quantize}
+to multiple levels (Q8\_0, Q5\_K\_M, and the deployment target
+\textbf{Q4\_K\_M}). The trimmed tokenizer required a one-line patch
+(\texttt{res="llama-bpe"}) to satisfy the converter's pre-tokenizer check.
+The Q4\_K\_M artifact is \textbf{1.53~GB}, runs at \SI{23.5}{tok/s} on CPU,
+and consumes $\approx$\SI{1.9}{GB} of RAM in total---within the target
+envelope.
+
+\subsection{Phase 7 --- Deployment and Evaluation}
+\paragraph{Deployment (RAG).} The 361 corpus chunks are embedded with
+\texttt{intfloat/multilingual-e5-small} (384-dim) and indexed with FAISS. At
+query time the top-4 retrieved chunks are injected into the context of a
+\texttt{llama-server} instance serving the Q4\_K\_M model
+(OpenAI-compatible API). This decouples volatile facts from the weights:
+documents can be updated without retraining.
+\paragraph{Evaluation.} Quality is measured on a 40-item subset of the test
+set, with identical RAG for all conditions, judged by an LLM
+(Gemini) using $\text{score}=\text{correct}+0.5\times\text{partial}$.
+Efficiency (size, RAM, latency) and out-of-domain regression
+(math/code probes) complete the three-axis evaluation.
+
+\subsection{The Three-Baseline Framework}
+Per the project's rigor requirement, all results are framed against three
+baselines (Table~\ref{tab:baselines}). The present report fully establishes
+the \textbf{B1$\leftrightarrow$B3} comparison; the B2 ablation and official
+\texttt{lm-eval-harness} runs are identified as remaining work.
+
+\begin{table}[H]
+  \centering
+  \caption{The three mandatory baselines.}
+  \label{tab:baselines}
+  \begin{tabularx}{\textwidth}{llL c}
+    \toprule
+    \textbf{ID} & \textbf{Configuration} & \textbf{Purpose} & \textbf{Status} \\
+    \midrule
+    B1 & Original Typhoon~2 3B & Upper-bound general model & \checkmark{} measured \\
+    B2 & Original $+$ QLoRA $+$ quantize (no prune) & Isolate the prune effect & future work \\
+    B3 & Full pipeline (trim $+$ prune $+$ recover $+$ quant.) & The proposed model & \checkmark{} measured \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Reproducibility and Hardware Notes}
+All stages ran on Windows~11 with an RTX~3050 Laptop GPU (\SI{4}{GB} VRAM);
+bf16 stages were made feasible by CUDA system-memory fallback (spilling to
+host RAM, $\sim$9$\times$ faster than CPU). Several platform-specific
+pitfalls were encountered and worked around: importing
+\texttt{transformers.Trainer}/\texttt{datasets} triggers a PyArrow segfault
+(addressed by a hand-written training loop); \texttt{sentence\_transformers}
+likewise segfaults (addressed by calling \texttt{AutoModel} directly); and
+the GGUF tooling's pip dependencies can silently downgrade PyTorch to a CPU
+build.
+
+% =====================================================================
+\section{Results and Discussion}
+\label{sec:results}
+
+\subsection{Axis 1 --- Size}
+Table~\ref{tab:size} summarizes the size reduction. The 20.5\% parameter
+reduction decomposes into vocabulary trimming ($-256$M, via dropped
+unused-language tokens) and layer pruning ($28{\to}24$, $-4$ layers); the
+remaining file-size reduction comes from Q4\_K\_M quantization. Relative to
+the original bf16 weights, the deployable artifact is \textbf{76.2\%
+smaller}.
+
+\begin{table}[H]
+  \centering
+  \caption{Axis~1 --- size comparison (original B1 vs.\ specialized B3).}
+  \label{tab:size}
+  \begin{tabular}{lrrr}
+    \toprule
+    \textbf{Metric} & \textbf{Original (B1)} & \textbf{New (B3)} & \textbf{Change} \\
+    \midrule
+    Total parameters             & \num{3212749824} & \num{2554100000} & $-20.5\%$ \\
+    Vocabulary                   & \num{128256}     & \num{44926}      & $-65.0\%$ \\
+    Transformer layers           & 28               & 24               & $-14.3\%$ \\
+    BPE merges                   & \num{280147}     & \num{103362}     & $-63.1\%$ \\
+    Weights (bf16)               & \SI{6.43}{GB}    & \SI{5.11}{GB}    & $-20.5\%$ \\
+    \textbf{Deploy weights (quant.)} & \SI{1.77}{GB} (4-bit) & \textbf{\SI{1.53}{GB}} (Q4\_K\_M) & $-13.6\%$ \\
+    Deploy vs.\ original bf16     & \SI{6.43}{GB}    & \SI{1.53}{GB}    & $\mathbf{-76.2\%}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Axis 2 --- Efficiency (Resources and Speed)}
+Table~\ref{tab:speed} reports the efficiency results. The headline finding is
+that the specialized model on a \emph{bare CPU} (\SI{23.5}{tok/s}) is faster
+than the original on a \emph{GPU} (\SI{10.6}{tok/s}), while requiring no
+discrete accelerator and $\sim$15.6\% less runtime memory.
+
+\begin{table}[H]
+  \centering
+  \caption{Axis~2 --- efficiency comparison.}
+  \label{tab:speed}
+  \begin{tabular}{lrrr}
+    \toprule
+    \textbf{Metric} & \textbf{Original (B1)} & \textbf{New (B3)} & \textbf{Change} \\
+    \midrule
+    Runtime RAM            & \SI{2.25}{GB} (VRAM) & $\sim$\SI{1.9}{GB} (RAM) & $-15.6\%$ \\
+    Device required        & GPU                  & CPU is enough            & --- \\
+    Generation speed       & \SI{10.6}{tok/s} (GPU) & \textbf{\SI{23.5}{tok/s}} (CPU) & $+122\%$ \\
+    Prompt speed           & ---                  & \SI{122}{tok/s} (CPU)    & --- \\
+    Time / answer ($\sim$60 tok) & $\sim$\SI{6}{s} & $\sim$\SI{3}{s}          & $-50\%$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Axis 3 --- Quality}
+\paragraph{In-domain (improved).} Table~\ref{tab:quality} shows that the
+specialized model \emph{outperforms} the original on the domain test set,
+both with and without RAG. Recovery fine-tuning taught the model the
+domain's answer style and specific facts (e.g.\ Thai request-form codes
+such as ``\texttt{Jor.Tor.}'', submission channels, and schedules), whereas
+the original answers generically. RAG benefits both models by supplying
+ground-truth facts.
+
+\begin{table}[H]
+  \centering
+  \caption{Axis~3 --- in-domain quality (40-item test subset, LLM judge).}
+  \label{tab:quality}
+  \begin{tabular}{lrrr}
+    \toprule
+    \textbf{Condition} & \textbf{Original (B1)} & \textbf{New (B3)} & \textbf{Change (rel.)} \\
+    \midrule
+    $+$ RAG  & \SI{35.0}{\percent} & \textbf{\SI{47.5}{\percent}} & $+35.7\%$ \\
+    No RAG   & \SI{16.2}{\percent} & \SI{41.2}{\percent}          & $+154\%$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Out-of-domain (intentionally degraded).} Probes confirm the loss
+of general ability (Table~\ref{tab:ood}): arithmetic and code generation fail
+after specialization. Per the project's design philosophy, this regression is
+not a defect but \emph{positive evidence} that the model traded general
+competence for domain expertise and compactness.
+
+\begin{table}[H]
+  \centering
+  \caption{Axis~3 --- out-of-domain regression probes (new model B3).}
+  \label{tab:ood}
+  \begin{tabularx}{\textwidth}{lLc}
+    \toprule
+    \textbf{Task} & \textbf{B3 answer} & \textbf{Status} \\
+    \midrule
+    $17 \times 23 = ?$       & 411 (correct: 391)                 & wrong \\
+    Fibonacci function       & ``uses the recursive method'' (no code) & vague \\
+    Solve $2x+5=13$          & $2x=8$ (does not finish $x=4$)      & incomplete \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Discussion}
+\paragraph{Where the savings really come from.} The parameter budget
+(Table~\ref{tab:budget}) correctly predicted that vocabulary trimming would
+be a minor lever for a 3B model ($\sim$12\% of parameters live in the
+embedding) and that structured pruning of the transformer stack is the
+dominant contributor. The empirical 20.5\% reduction is consistent with this:
+vocab trim contributes $\sim$8\% and layer pruning the remainder.
+
+\paragraph{Plan-versus-reality corrections.} Two assumptions in the original
+plan did not survive contact with the model. First, vocabulary trimming
+cannot reach $\sim$40k by dropping dead languages alone, because the
+tokenizer is English-dominant; reaching the target requires deliberately
+discarding rarely-used English/code tokens---which is, fortuitously, aligned
+with the specialization goal. Second, the canonical ShortGPT $28{\to}20$
+configuration is infeasible: removing eight contiguous layers raises
+perplexity to 237 and produces degenerate output. The recoverable knee lies
+at $28{\to}24$. These corrections are themselves useful contributions, as
+both assumptions are common in the compression literature.
+
+\paragraph{Cost-effectiveness.} Combining the three axes, the specialized
+model is one-fifth smaller, roughly twice as fast, GPU-free, and
+\emph{better} in-domain than the original. For a single-purpose deployment
+this is a clearly favorable trade, achieved entirely on commodity hardware.
+
+\paragraph{Threats to validity.} In-domain quality is measured on 40 of 403
+test items with an LLM judge---an indicator rather than a certified
+benchmark. Out-of-domain regression is, so far, a qualitative probe; official
+\texttt{gsm8k}/\texttt{humaneval} numbers are deferred to GPU compute.
+Finally, B1 was measured on GPU 4-bit and B3 on CPU Q4, reflecting realistic
+deployment conditions but differing hardware. The B2 ablation, which isolates
+the pruning contribution from QLoRA$+$quantization, remains outstanding.
+
+% =====================================================================
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+\subsection{Conclusion}
+This report presented \textbf{Pholama}, a complete seven-stage pipeline that
+compresses and specializes a \param{3.21} Thai--English LLM into a
+\param{2.55}, 1.53~GB, CPU-deployable domain expert for Chula Registrar
+question answering. The model is 20.5\% smaller, 122\% faster on CPU than the
+original on GPU, fits within $\sim$1.9~GB of RAM, and answers the target
+domain 35.7\% better (relative) under RAG---while shedding out-of-domain
+ability by design. Every stage was executed on a single \SI{4}{GB}-VRAM
+laptop, demonstrating that the full compress-and-specialize workflow is
+accessible without cloud resources.
+
+\subsection{Future Work}
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Complete the baseline matrix.} Run the B2 ablation (original
+        $+$ QLoRA $+$ quantize, no pruning) to isolate the pruning
+        contribution, and obtain official \texttt{lm-eval-harness}
+        (\texttt{gsm8k}, \texttt{humaneval}) numbers across B1/B2/B3 on GPU.
+  \item \textbf{Push the aggressive variant.} The \param{2.1011} FFN-pruned
+        model is not yet recovered/quantized; with recovery it may offer an
+        even smaller deployment point.
+  \item \textbf{Toward truly tiny devices.} The project's long-term goal is
+        sub-gigabyte, microcontroller-class deployment (smartwatch- or
+        calculator-class hardware). Promising directions include extreme
+        quantization (2--3 bit, e.g.\ ternary/1.58-bit schemes), KV-cache
+        quantization, knowledge distillation into a smaller student, and
+        speculative or streaming decoding to reduce latency on constrained
+        CPUs.
+  \item \textbf{Broaden evaluation.} Expand the human-/judge-scored test set
+        beyond 40 items and add calibration and hallucination metrics under
+        RAG.
+\end{itemize}
+
+% =====================================================================
+\section*{Acknowledgments}
+\addcontentsline{toc}{section}{Acknowledgments}
+The author thanks the maintainers of the open-source tools that made this
+work possible---PyTorch, Hugging Face Transformers/PEFT, \texttt{bitsandbytes},
+FAISS, and \texttt{llama.cpp}---and acknowledges the public information
+published by the Office of the Registrar, Chulalongkorn University, used as
+the domain corpus.
+
+% =====================================================================
+% References. Two options are provided:
+%   (A) BibTeX: uncomment \bibliography lines below and create report.bib
+%       (a placeholder report.bib is given in the comment block).
+%   (B) A manual thebibliography fallback is included so the document
+%       compiles stand-alone without a .bib file.
+% =====================================================================
+\addcontentsline{toc}{section}{References}
+
+% ---- Option A: BibTeX (recommended) ----
+% \bibliographystyle{plain}
+% \bibliography{report}
+%
+% Placeholder report.bib entries:
+% @inproceedings{ushio2023vocab,
+%   author    = {Ushio, Asahi and Zhou, Yi and Camacho-Collados, Jose},
+%   title     = {An Efficient Multilingual Language Model Compression
+%                through Vocabulary Trimming},
+%   booktitle = {Findings of EMNLP},
+%   year      = {2023},
+%   eprint    = {2305.15020},
+%   archivePrefix = {arXiv}
+% }
+% @article{men2024shortgpt,
+%   author  = {Men, Xin and others},
+%   title   = {ShortGPT: Layers in Large Language Models are More Redundant
+%              than You Expect},
+%   journal = {arXiv preprint arXiv:2403.03853},
+%   year    = {2024}
+% }
+% @inproceedings{dettmers2023qlora,
+%   author    = {Dettmers, Tim and Pagnoni, Artidoro and Holtzman, Ari
+%                and Zettlemoyer, Luke},
+%   title     = {{QLoRA}: Efficient Finetuning of Quantized {LLMs}},
+%   booktitle = {NeurIPS},
+%   year      = {2023}
+% }
+% @inproceedings{hu2022lora,
+%   author    = {Hu, Edward J. and others},
+%   title     = {{LoRA}: Low-Rank Adaptation of Large Language Models},
+%   booktitle = {ICLR},
+%   year      = {2022}
+% }
+% @inproceedings{sun2024wanda,
+%   author    = {Sun, Mingjie and Liu, Zhuang and Bair, Anna and Kolter, J. Zico},
+%   title     = {A Simple and Effective Pruning Approach for Large Language Models},
+%   booktitle = {ICLR},
+%   year      = {2024}
+% }
+% @article{dubey2024llama3,
+%   author  = {Dubey, Abhimanyu and others},
+%   title   = {The Llama 3 Herd of Models},
+%   journal = {arXiv preprint arXiv:2407.21783},
+%   year    = {2024}
+% }
+% @article{ma2023llmpruner,
+%   author  = {Ma, Xinyin and Fang, Gongfan and Wang, Xinchao},
+%   title   = {{LLM-Pruner}: On the Structural Pruning of Large Language Models},
+%   journal = {NeurIPS},
+%   year    = {2023}
+% }
+% @misc{lewis2020rag,
+%   author = {Lewis, Patrick and others},
+%   title  = {Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks},
+%   year   = {2020}, eprint = {2005.11401}, archivePrefix = {arXiv}
+% }
+
+% ---- Option B: manual fallback bibliography (compiles without .bib) ----
+\begin{thebibliography}{9}
+
+\bibitem{ushio2023vocab}
+A.~Ushio, Y.~Zhou, and J.~Camacho-Collados,
+``An Efficient Multilingual Language Model Compression through Vocabulary
+Trimming,'' in \emph{Findings of EMNLP}, 2023. arXiv:2305.15020.
+
+\bibitem{men2024shortgpt}
+X.~Men \emph{et al.},
+``ShortGPT: Layers in Large Language Models are More Redundant than You
+Expect,'' arXiv:2403.03853, 2024.
+
+\bibitem{dettmers2023qlora}
+T.~Dettmers, A.~Pagnoni, A.~Holtzman, and L.~Zettlemoyer,
+``QLoRA: Efficient Finetuning of Quantized LLMs,'' in \emph{NeurIPS}, 2023.
+
+\bibitem{hu2022lora}
+E.~J.~Hu \emph{et al.},
+``LoRA: Low-Rank Adaptation of Large Language Models,'' in \emph{ICLR}, 2022.
+
+\bibitem{sun2024wanda}
+M.~Sun, Z.~Liu, A.~Bair, and J.~Z.~Kolter,
+``A Simple and Effective Pruning Approach for Large Language Models (Wanda),''
+in \emph{ICLR}, 2024.
+
+\bibitem{ma2023llmpruner}
+X.~Ma, G.~Fang, and X.~Wang,
+``LLM-Pruner: On the Structural Pruning of Large Language Models,''
+in \emph{NeurIPS}, 2023.
+
+\bibitem{dubey2024llama3}
+A.~Dubey \emph{et al.},
+``The Llama 3 Herd of Models,'' arXiv:2407.21783, 2024.
+
+\bibitem{lewis2020rag}
+P.~Lewis \emph{et al.},
+``Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks,''
+in \emph{NeurIPS}, 2020. arXiv:2005.11401.
+
+\bibitem{llamacpp}
+G.~Gerganov \emph{et al.},
+``llama.cpp: LLM inference in C/C++,''
+\url{https://github.com/ggerganov/llama.cpp}, 2023--.
+
+\end{thebibliography}
+
+\end{document}
